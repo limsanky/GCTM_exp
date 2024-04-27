@@ -31,15 +31,15 @@
 # --offline
 
 # CUDA_VISIBLE_DEVICES=0 python train_gctm_adam.py \
-CUDA_VISIBLE_DEVICES=0 python ../../train_gctm.py \
+CUDA_VISIBLE_DEVICES=0 python ../../train_gctm_htransform.py \
 --datasets 'cifar10' 'gaussian' \
 --data_roots '/root/data/cifar10' '/root/data/gaussian' \
---base_dir '/root/code/results/0424/cifar10_zero/' \
+--base_dir '/root/code/results/0427/htransform/cifar10_uncond/' \
 --size 32 \
---X1_eps_std 0.0 \
+--X1_eps_std 0.05 \
 --vars 0.25 1.0 0.0 \
---coupling 'independent' \
---coupling_bs 64 \
+--coupling 'htransform' \
+--coupling_bs 128 \
 --disc_steps 1280 \
 --init_steps 10 \
 --double_iter 50000 \
@@ -48,7 +48,7 @@ CUDA_VISIBLE_DEVICES=0 python ../../train_gctm.py \
 --smax 80.0 \
 --edm_rho 7 \
 --ODE_N 1 \
---bs 64 \
+--bs 128 \
 --lr 2e-4 \
 --lmda_CTM 1.0 \
 --ctm_distance 'ph' \
@@ -62,4 +62,4 @@ CUDA_VISIBLE_DEVICES=0 python ../../train_gctm.py \
 --n_FID 5000 \
 --t_sm_dists 'lognormal' \
 --param 'hTransform' \
---compare_zero
+# --compare_zero

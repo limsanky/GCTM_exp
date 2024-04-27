@@ -1,6 +1,6 @@
 CUDA_VISIBLE_DEVICES=0 python train_gctm_adam_sep.py \
 --datasets 'edges2shoes' \
---base_dir 'results/pix2pix/edges2shoes_1' \
+--base_dir '/root/code/results/date/pix2pix/edges2shoes_1' \
 --ckpt_name 'idx_46750_curr.pt' \
 --size 64 \
 --X1_eps_std 0.05 \
