@@ -17,6 +17,48 @@ import math
 import time
 import os
 
+from torch_utils import logger
+import nvidia_smi
+import gc
+
+def clear_cache():
+    return
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def calculate_adaptive_weight(loss_top, loss_bottom, last_layer_weights=None):
+    loss_top_grad = torch.autograd.grad(loss_top, last_layer_weights, retain_graph=True)[0]
+    loss_bottom_grad = torch.autograd.grad(loss_bottom, last_layer_weights, retain_graph=True)[0]
+    
+    d_weight = torch.norm(loss_top_grad) / (torch.norm(loss_bottom_grad) + 1e-4)
+    
+    d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+    return d_weight.item()
+
+def adopt_weight(weight, global_step, threshold=0, value=0.):
+    if global_step < threshold:
+        return value
+    return weight
+
+def improved_loss_weighting(sigmas: torch.Tensor) -> torch.Tensor:
+    """Computes the weighting for the consistency loss.
+
+    Parameters
+    ----------
+    sigmas : Tensor
+        Standard deviations of the noise.
+
+    Returns
+    -------
+    Tensor
+        Weighting for the consistency loss.
+
+    References
+    ----------
+    [1] [Improved Techniques For Consistency Training](https://arxiv.org/pdf/2310.14189.pdf)
+    """
+    return 1 / (sigmas[1:] - sigmas[:-1])
+
 def save_ckpt(X0_eval, X1_eval, net, net_ema, opt_CTM, avgmeter, best_FID, ckpt_dir, idx, best=False):
     
     ckpt = {
@@ -34,31 +76,51 @@ def save_ckpt(X0_eval, X1_eval, net, net_ema, opt_CTM, avgmeter, best_FID, ckpt_
     else:
         torch.save(ckpt, os.path.join(ckpt_dir, 'idx_{}_curr.pt'.format(idx)))
 
-def train(datasets, data_roots, X1_eps_std, vars, coupling, lmda_CTM, solver, ctm_distance, compare_zero, size, discretization, smin, smax, edm_rho,
+def train(args, datasets, data_roots, X1_eps_std, vars, coupling, lmda_CTM, solver, ctm_distance, compare_zero, size, discretization, smin, smax, edm_rho,
           t_sm_dists, disc_steps, init_steps, ODE_N, bs, coupling_bs, lr, ema_decay, n_grad_accum, offline, double_iter, t_ctm_dists,
           nc, model_channels, num_blocks, dropout, param, v_iter, s_iter, b_iter, FID_iter, FID_bs, n_FID, n_viz, n_save, base_dir, ckpt_name):
+     
+    # Mistakes are fixed (by sanky).
+    USE_FIXED_VERSION = False
+    USE_COMBINED_LOSS = True
     
-    size = max(size,32)
+    # print_gpu_usage('Before everything')
+    
+    # print("\n\n\nonce more!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n\n")
+    size = max(size, 32)
     sampler = Sampler(datasets, data_roots, nc, size, X1_eps_std, coupling, coupling_bs, bs)
     disc = get_discretization(discretization,disc_steps,smin=smin,smax=smax,rho=edm_rho,t_sm_dists=t_sm_dists,t_ctm_dists=t_ctm_dists)
     ctm_dist, l2_loss = get_distance(ctm_distance), get_distance('l2')
-    solver = get_solver(solver,disc)
+    # ddbm_dist = get_distance('ph')
+    
+    solver = get_solver(solver, disc)
 
     vars[1] += X1_eps_std**2
-    net = SongUNet(vars=vars, param=param, discretization=disc, img_resolution=size, in_channels=nc, out_channels=nc,
-                   num_blocks=num_blocks, dropout=dropout, model_channels=model_channels).cuda()
-    opt_CTM = optim.Adam(net.parameters(), lr=lr)
-    net_ema = copy.deepcopy(net)
 
+    net: torch.nn.Module = SongUNet(vars=vars, param=param, discretization=disc, img_resolution=size, in_channels=nc, out_channels=nc,
+                   num_blocks=num_blocks, dropout=dropout, model_channels=model_channels,
+                #    encoder_type='residual',
+                ).cuda()
+    # net.bfloat16()
+    # opt_CTM = optim.Adam(net.parameters(), lr=lr)
+    opt_CTM = optim.RAdam(net.parameters(), lr=4e-4, weight_decay=0.0)
+    net_ema: torch.nn.Module = copy.deepcopy(net)
+    
     avgmeter = AverageMeter(window=125,
-                            loss_names=['DSM Loss', 'CTM Loss', 'FID'],
-                            yscales=['log','log','linear'])
+                            loss_names=['DSM Loss', 'CTM Loss', 
+                                        'DSM Weight', 
+                                        'FID'],
+                            yscales=['log', 'log', 
+                                     'linear', 
+                                     'linear'])
 
     loss_dir = os.path.join(base_dir, 'losses')
     sample_B_dir = os.path.join(base_dir, 'samples_B')
     sample_F_dir = os.path.join(base_dir, 'samples_F')
     ckpt_dir = os.path.join(base_dir, 'ckpts')
-    X0_stat_path = os.path.join('FID_stats', '{}_{}.npz'.format(datasets[0],size))
+    # X0_stat_path = os.path.join('FID_stats', '{}_{}.npz'.format(datasets[0],size))
+    X0_stat_path = os.path.join('/root/code/FID_stats', '{}_{}.npz'.format(datasets[0],size))
+    # X0_stat_path = os.path.join(base_dir, 'FID_stats0', '{}_{}.npz'.format(datasets[0], size))
 
     if ckpt_name:
         print('\nLoading state from [{}]\n'.format(ckpt_name))
@@ -76,27 +138,54 @@ def train(datasets, data_roots, X1_eps_std, vars, coupling, lmda_CTM, solver, ct
         X0_eval = torch.cat([sampler.sample_X0() for _ in range(math.ceil(n_viz/bs))], dim=0)[:n_viz]
         X1_eval = torch.cat([sampler.sample_X1() for _ in range(math.ceil(n_viz/bs))], dim=0)[:n_viz]
         best_FID = 10000
-        create_dir(base_dir,prompt=True)
+        create_dir(base_dir, prompt=True)
         create_dir(loss_dir)
         create_dir(sample_B_dir)
         create_dir(sample_F_dir)
         create_dir(ckpt_dir)
+        # create_dir(os.path.join(base_dir, 'FID_stats0'))
+        # create_dir(X0_stat_path)
+    
+    logger.configure(args, dir=base_dir)
     
     # Evaluate initial FID and visualize X1 samples
     t0 = disc.get_ts(disc_steps)[0]
     t1 = disc.get_ts(disc_steps)[-1]
+
+    # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
     curr_FID = eval_FID(lambda:sampler.sample_X1(), X0_stat_path, t1, t0, net_ema, n_FID, sample_B_dir, fid_bs=FID_bs, verbose=True)
+    print_gpu_usage('After computing DM FIDs')
     viz_img(X1_eval, t1, t1, net_ema, sample_B_dir, 0)
     
     # Training loop
+    sub_steps_history = []
     seed = int(time.time())
+    
+    print_gpu_usage('Before Emptying Cache')
+    clear_cache()
+    print_gpu_usage('After Emptying Cache; Before Training')
+        
     while True:
+        
         if double_iter is not None:
-            sub_steps = min(disc_steps,init_steps*2**(avgmeter.idx//double_iter))
+            sub_steps = min(disc_steps, init_steps*2**(avgmeter.idx//double_iter))
         else:
             sub_steps = init_steps
         
+        # print('sub_steps:',sub_steps)
+        assert (sub_steps <= 1280)
+        if len(sub_steps_history) == 0:
+            sub_steps_history.append(sub_steps)
+            
+        if sub_steps_history[-1] != sub_steps:
+            assert sub_steps_history[-1] < sub_steps, 'There is some error in the sub_steps history list.'
+            sub_steps_history.append(sub_steps)
+            print(f'Number of Iterations has doubled, from {sub_steps_history[-2]} -> {sub_steps_history[-1]}.')
+        
+        # Freeze EMA Model (4/19)
+        net_ema.requires_grad_(False)
         opt_CTM.zero_grad()
+        
         for accum_idx in range(n_grad_accum):
             # Sample data
             X0, X1 = sampler.sample_joint()
@@ -105,59 +194,115 @@ def train(datasets, data_roots, X1_eps_std, vars, coupling, lmda_CTM, solver, ct
 
             t_idx, s_idx, u_idx, v_idx, t, s, u, v = disc.sample_ctm_times(bs, sub_steps)
             Xt = (1 - t).reshape(-1,1,1,1) * X0 + t.reshape(-1,1,1,1) * X1
-
+            
+            # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # Calculate CTM Loss
             with torch.no_grad():
                 if offline:
                     net_ema.eval()
-                    Xu_real = solver.solve(Xt,t_idx,u_idx,net_ema,sub_steps,ODE_N)
+                    Xu_solved = solver.solve(Xt, t_idx, u_idx, net_ema, sub_steps, ODE_N)
                 else:
                     net.train()
-                    Xu_real = solver.solve(Xt,t_idx,u_idx,net,sub_steps,ODE_N,seed)
+                    Xu_solved = solver.solve(Xt, t_idx, u_idx, net, sub_steps, ODE_N, seed)
                 
+            if USE_FIXED_VERSION:
+                # net.train()
+                net_ema.eval()
+                torch.manual_seed(seed)
+                Xs_real = net_ema(Xu_solved, u, s)[0] # <- Fixed.
+            else:
                 net.train()
                 torch.manual_seed(seed)
-                Xs_real = net(Xu_real,u,s)[0]
-                
+                Xs_real = net(Xu_solved, u, s)[0] # <- Mistake; should've used the stop-grad model.
+            
+            # net_ema.eval()
+            # X_real = net_ema(Xs_real, s, t0*torch.zeros_like(s)) if compare_zero else Xs_real
+            if compare_zero:
                 net_ema.eval()
-                X_real = net_ema(Xs_real,s,t0*torch.zeros_like(s)) if compare_zero else Xs_real
-
+                X_real = net_ema(Xs_real, s, torch.zeros_like(s)*t0)
+            else:
+                X_real = Xs_real
+            
             net.train()
             net_ema.eval()
             torch.manual_seed(seed)
-            Xs_fake, cout = net(Xt,t,s)
-            X_fake = net_ema(Xs_fake,s,t0*torch.zeros_like(s)) if compare_zero else Xs_fake
-            loss_CTM = ctm_dist(X_fake,X_real,cout*(1-s/t))/(n_grad_accum*bs)
-            (lmda_CTM*loss_CTM).backward()
-            seed += 1
+            
+            Xs_fake, cout = net(Xt, t, s)
+            
+            # X_fake = net_ema(Xs_fake,s,t0*torch.zeros_like(s)) if compare_zero else Xs_fake
+            if compare_zero:
+                X_fake = net_ema(Xs_fake, s, torch.zeros_like(s)*t0)
+            else:
+                X_fake = Xs_fake
+            
+            if USE_COMBINED_LOSS:
+                
+                # Calculate CTM Loss
+                loss_CTM = lmda_CTM * ctm_dist(X_fake, X_real, cout * (1 - s/t)) / (n_grad_accum * bs)
+                # loss_CTM.backward()
+                seed += 1
+                # print("gooooooooooooooooood")
+                # Calculate DSM Loss
+                net.train()
+                X0_pred, cout = net(Xt_sm, t_sm, t_sm, return_g=True)
+                loss_DSM = l2_loss(X0, X0_pred, cout) / (n_grad_accum*bs)
+                
+                weight_DSM = calculate_adaptive_weight(loss_CTM, loss_DSM, net.dec['32x32_aux_conv'].weight)
+                balance_weight_DSM = adopt_weight(weight_DSM, global_step=avgmeter.idx, threshold=0, value=1.)
+                # balance_weight_DSM = 1
+                
+                # print("weight DSM:", weight_DSM.item(), 'balance weight dsm', balance_weight_DSM.item())
+                # weights = improved_loss_weighting() # 1 / (t-u)
+                
+                # loss_DSM.backward()
+                loss = loss_CTM + (balance_weight_DSM * loss_DSM)
+                loss.backward()
+            else:
+                
+                # Calculate CTM Loss
+                loss_CTM = lmda_CTM * ctm_dist(X_fake, X_real, weight=cout * (1 - s/t)) / (n_grad_accum * bs)
+                # weights = improved_loss_weighting() # 1 / (t-u)
+                loss_CTM.backward()
+                seed += 1
 
-            # Calculate DSM Loss
-            net.train()
-            X0_fake, cout = net(Xt_sm,t_sm,t_sm,return_g=True)
-            loss_DSM = l2_loss(X0_fake,X0,cout)/(n_grad_accum*bs)
-            loss_DSM.backward()
-
+                # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Calculate DSM Loss
+                net.train()
+                X0_pred, cout = net(Xt_sm, t_sm, t_sm, return_g=True)
+                loss_DSM = l2_loss(X0, X0_pred, cout) / (n_grad_accum*bs)
+                
+                loss_DSM.backward()
+                
             if accum_idx == n_grad_accum-1:
                 opt_CTM.step()
+                # print_gpu_usage('After one step training; Before emptying cache')
+                clear_cache()
+                # print_gpu_usage('After emptying cache')
 
         # EMA update
         if double_iter is not None:
-            ema_list = [0.999]
-            ema_decay_curr = ema_list[min(int(avgmeter.idx//double_iter),2)]
+            ema_list = [0.999, 0.9999, 0.99993]
+            # ema_decay_curr = ema_list[min(int(avgmeter.idx//double_iter), 2)]
+            # ema_decay_curr = 0. # Following iCT
+            # ema_decay_curr = 0.99993
+            ema_decay_curr = 0.999
         else:
             ema_decay_curr = ema_decay
         with torch.no_grad():
-            for p, p_ema in zip(net.parameters(),net_ema.parameters()):
+            for p, p_ema in zip(net.parameters(), net_ema.parameters()):
                 p_ema.data = ema_decay_curr * p_ema + (1 - ema_decay_curr) * p
 
         # Loss tracker update
         avgmeter.update({'DSM Loss' : loss_DSM.item()*n_grad_accum,
                          'CTM Loss' : loss_CTM.item()*n_grad_accum,
-                         'FID'      : curr_FID})
+                         'FID'      : curr_FID,
+                         'DSM Weight': balance_weight_DSM,
+                         })
         
         # Loss and sample visualization
         if avgmeter.idx % v_iter == 0:
-            print(avgmeter)
+            # print(avgmeter)
+            logger.log(avgmeter)
             avgmeter.plot_losses(os.path.join(loss_dir, 'losses.jpg'), nrows=1)
             viz_img(X1_eval, t1, t0, net_ema, sample_B_dir, None)
 
@@ -175,12 +320,29 @@ def train(datasets, data_roots, X1_eps_std, vars, coupling, lmda_CTM, solver, ct
         
         # Evaluating Quick FID
         if avgmeter.idx % FID_iter == 0:
-            curr_FID = eval_FID(lambda:sampler.sample_X1(), X0_stat_path, t1, t0, net_ema, n_FID, sample_B_dir, fid_bs=FID_bs, verbose=True)
+            # if not ckpt_name:
+            #     create_dir(os.path.join(base_dir, f'FID_stats{avgmeter.idx//FID_iter}'))
+            # X0_stat_path_new = os.path.join(base_dir, f'FID_stats{avgmeter.idx//FID_iter}', '{}_{}.npz'.format(datasets[0], size))
+            # curr_FID = eval_FID(lambda:sampler.sample_X1(), X0_stat_path_new, t1, t0, net_ema, n_FID, sample_B_dir, fid_bs=FID_bs, verbose=True)
+            curr_FID = eval_FID(lambda: sampler.sample_X1(), X0_stat_path, t1, t0, net_ema, n_FID, sample_B_dir, fid_bs=FID_bs, verbose=True)
             if curr_FID < best_FID:
                 best_FID = curr_FID
                 save_ckpt(X0_eval, X1_eval, net, net_ema, opt_CTM, avgmeter, best_FID, ckpt_dir, avgmeter.idx, best=True)
 
+
+nvidia_smi.nvmlInit()
+deviceCount = nvidia_smi.nvmlDeviceGetCount()
+def print_gpu_usage(prefix=''):
+        for i in range(deviceCount):
+            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
+            util = nvidia_smi.nvmlDeviceGetUtilizationRates(handle)
+            mem = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+            logger.log(
+                f"{prefix} |Device {i}| Mem Free: {mem.free / 1024 ** 2:5.2f}MB / {mem.total / 1024 ** 2:5.2f}MB | gpu-util: {util.gpu / 100.0:3.1%} | gpu-mem: {util.memory / 100.0:3.1%} |")
+
+
 def main():
+    
     parser = argparse.ArgumentParser()
 
     # Basic experiment settings
@@ -241,8 +403,9 @@ def main():
     def print_args(**kwargs):
         print('\nTraining with settings :\n')
         pprint.pprint(kwargs)
+        
     print_args(**vars(args))
-    train(**vars(args))
+    train(args=args, **vars(args))
 
 if __name__ == '__main__':
     main()
