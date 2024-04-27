@@ -21,6 +21,18 @@ def get_coupling(coupling, batch_size, **kwargs):
         raise ValueError('Coupling {} not found'.format(coupling))
     return __couplings__[coupling](batch_size, **kwargs)
 
+@register_coupling('htransform')
+class hTransform:
+    def __init__(self, batch_size, **kwargs):
+        self.batch_size = batch_size
+    
+    def __call__(self, X0, X1):
+        # raise NotImplementedError('ToDo: h-transform.')
+        X0, X1 = X0[0].cuda(), X1[0].cuda() # remove labels
+        idx_X0 = torch.randperm(X0.shape[0])[:self.batch_size]
+        idx_X1 = torch.randperm(X1.shape[0])[:self.batch_size]
+        return X0[idx_X0], X1[idx_X1]
+    
 @register_coupling('independent')
 class IndependentCoupling:
     def __init__(self, batch_size, **kwargs):
