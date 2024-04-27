@@ -369,6 +369,9 @@ class SongUNet(torch.nn.Module):
             t_emb, s_emb = embed_time(t.float(), 't'), embed_time(s.float(), 's')
         
         elif self.param == 'LIN':
+            # print('t', t)
+            # print('s', s)
+            # # exit()
             scale_t = torch.ones_like(t)
             scale_s = torch.ones_like(s)
             tbar = 1.0 - t
@@ -391,8 +394,82 @@ class SongUNet(torch.nn.Module):
                     emb = silu(self.t_map_layer0(emb))
                     emb = silu(self.t_map_layer1(emb))
                 return emb
+            
             t_emb, s_emb = embed_time(t.float(), 't'), embed_time(s.float(), 's')
+            
+        elif self.param == 'hTransform':
+            # Convert everything to VE framework
+            SMAX = self.disc.smax if (self.disc.__class__.__name__ =='EDM_N2I') else  1 / self.disc.smin
+            scale_t = 1/(1.0-t)
+            scale_t[scale_t==torch.inf] = SMAX
+            scale_s = 1/(1.0-s)
+            scale_s[scale_s==torch.inf] = SMAX
+            x = scale_t.reshape(-1,1,1,1) * x
 
+            t = t/(1.0-t)
+            t[t==torch.inf] = SMAX
+            s = s/(1.0-s)
+            s[s==torch.inf] = SMAX
+            
+            # if conditional_gen:
+            # PS: remove the code above cz it is reslacing t from o,1 -> 0.002, 80
+            #     alpha_t, alpha_T = 1, 1
+            #     sigma_data0, sigma_dataT = 0.5, np.sqrt(SMAX**2 + 0.5**2) #(SMAX or 1 or np.sqrt(sigma_data0**2 + SMAX**2))
+            #     snr_t, snr_T = t, sigma_dataT 
+            #     sigma_data0T = sigma_data0**2
+                
+            #     a_t = ((alpha_t / alpha_T) * (snr_t / snr_T))
+            #     b_t = (alpha_t * (1 - (snr_t / snr_T)))
+            #     c_t = ((t ** 2) * (1 - (snr_t / snr_T)))
+                
+            #     cin = 1 / (((a_t * SMAX)**2) + ((b_t * sigma_data0)**2) + (2 * a_t * b_t * sigma_data0T) + c_t).sqrt()
+            #     # print('t', t)
+            #     # print('t shape', t.shape)
+            #     # print('cin', cin)
+            #     # print('shape', cin.shape)
+            #     # exit()
+            #     cskip = (b_t * (sigma_data0**2) + (a_t * sigma_data0T)) * (cin ** 2)
+            #     cout = (
+            #         (a_t**2) * (((sigma_data0 * sigma_dataT)**2) - (sigma_data0T**2)) +
+            #         (sigma_data0**2) * c_t
+            #     ).sqrt()
+            #     cout *= cin
+            # else:
+            
+            # print('t', t)
+            # exit()
+            sigma_data0 = 0.5
+            epsilon = 0.002 # = smin
+            # EDM conditioning variables
+            cin = 1 / ( (t - epsilon).square() + np.square(sigma_data0) ).sqrt()
+            cskip = cin.square() * np.square(sigma_data0)
+            
+            # sigma_dataT = np.sqrt(0.5**2 + 1)
+            # cin2 = 1 / ( (t - epsilon).square() + np.square(sigma_dataT) ).sqrt()
+            # cskip2 = cin2.square() * np.square(sigma_dataT)
+            
+            # cout = ((1 - cskip).square() * var0 + cskip.square() * t.square() * var1 - 2 * (1 - cskip) * cskip * t * var01).sqrt()
+            cout = sigma_data0 * (t - epsilon) / (np.square(sigma_data0) + t.square()).sqrt()
+
+            # Mapping.
+            def embed_time(noise_labels, time_label='t'):
+                noise_labels[noise_labels==0.0] = self.disc.smin
+                noise_labels = (1/4) * noise_labels.log()
+                emb = self.map_noise(noise_labels)
+                emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
+                if time_label == 't':
+                    emb = silu(self.t_map_layer0(emb))
+                    emb = silu(self.t_map_layer1(emb))
+                else:
+                    emb = silu(self.t_map_layer0(emb))
+                    emb = silu(self.t_map_layer1(emb))
+                return emb
+            
+            t_emb, s_emb = embed_time(t.float(), 't'), embed_time(s.float(), 's')
+        
+        else:
+            raise NotImplementedError("'param' has not been provided!")
+        
         # Encoder.
         xt = x.clone()
         x = cin.reshape(-1,1,1,1) * x
@@ -425,10 +502,12 @@ class SongUNet(torch.nn.Module):
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, t_emb, s_emb)
         
+        # g = denoised of ddbm
+        # aux = model_output of ddbm
         g = cskip.reshape(-1,1,1,1) * xt + cout.reshape(-1,1,1,1) * aux
         mask = torch.ones_like(t)
         mask[~(s == t)] = (s/t)[~(s == t)]
-        G = (mask.reshape(-1,1,1,1) * xt + (1-mask).reshape(-1,1,1,1) * g) / scale_s.reshape(-1,1,1,1)
+        G = (mask.reshape(-1,1,1,1) * xt + (1 - mask).reshape(-1,1,1,1) * g) / scale_s.reshape(-1,1,1,1)
         if return_g:
             if self.training:
                 return g, cout
