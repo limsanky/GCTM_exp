@@ -26,6 +26,7 @@ class Solver:
     def __step__(self,xt,t,tm1,net,seed=None):
         pass
 
+    @torch.no_grad()
     def solve(self,xt,t_idx,s_idx,net,sub_steps,ODE_N=1,seed=None):
         ODE_N = min(ODE_N,int(self.disc.disc_steps/sub_steps))
         t_idx, s_idx, sub_steps = ODE_N*t_idx, ODE_N*s_idx, ODE_N*sub_steps

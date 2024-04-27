@@ -3,3 +3,4 @@ results/*
 torch_utils/*
 torch_utils/
 *.pyc
+dnnlib/*
