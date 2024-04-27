@@ -34,6 +34,7 @@ class EDM:
 
     def sample_ctm_times(self, bs, sub_steps, max_skip_N=1):
         ts = self.get_ts(sub_steps)
+        # print('ts', ts)
         
         s_pdf = 1.0 - ts[:-1]
         s_pdf = s_pdf / s_pdf.sum()
@@ -51,12 +52,13 @@ class EDM:
 
         v_idx = (t_idx - max_skip_N).clamp(min=u_idx)
 
-        ts = self.get_ts(sub_steps)
+        # ts = self.get_ts(sub_steps)
         t, s, u, v = ts[t_idx], ts[s_idx], ts[u_idx], ts[v_idx]
         return t_idx, s_idx, u_idx, v_idx, t, s, u, v
     
     def sample_sm_times(self, bs, sub_steps):
         ts = self.get_ts(sub_steps)
+        
         if len(self.t_sm_dists) == 0:
             t_idx = torch.randint(low=1, high=sub_steps+1, size=[bs]).cuda()
         else:
@@ -87,19 +89,26 @@ class EDM:
             pdf = cdf[1:] - cdf[:-1]
             pdf = pdf / pdf.sum()
             t_idx = torch.multinomial(pdf, num_samples=bs, replacement=True) + 1
+            
         return t_idx, ts[t_idx]
     
 class EDM_N2I(EDM):
 
-    def __init__(self, disc_steps, smin=0.002, smax=80, rho=7, t_sm_dists=[], t_ctm_dists=[1.2,2]):
+    def __init__(self, disc_steps, smin=0.002, smax=80, rho=7, t_sm_dists=[], t_ctm_dists=[1.2, 2]):
         super().__init__(disc_steps, smin, smax, rho, t_sm_dists, t_ctm_dists)
     
     def get_ts(self, sub_steps):
-        ts = torch.linspace(np.power(self.smin,1/self.rho),np.power(self.smax,1/self.rho),self.disc_steps+1).pow(self.rho)
+        ts = torch.linspace(np.power(self.smin, 1/self.rho), np.power(self.smax, 1/self.rho), self.disc_steps+1).pow(self.rho)
+        # print(ts)
+        # print(ts+1)
+        # print(ts/(ts+1))
+        # exit()
         ts = ts / (ts + 1)
         ts[0] = 0.0
         ts[-1] = 1.0
+        
         ts = ts[torch.linspace(0,self.disc_steps,sub_steps+1,dtype=int)]
+        
         return ts.cuda()
 
 class EDM_I2I(EDM):
@@ -108,10 +117,11 @@ class EDM_I2I(EDM):
         super().__init__(disc_steps, smin, smax, rho, t_sm_dists)
     
     def get_ts(self, sub_steps):
-        ts = torch.linspace(np.power(self.smin,1/self.rho),np.power(self.smax,1/self.rho),int(0.5*self.disc_steps)+1).pow(self.rho)
+        ts = torch.linspace(np.power(self.smin, 1/self.rho), np.power(self.smax, 1/self.rho), int(0.5*self.disc_steps)+1).pow(self.rho)
+        
         ts = ts / (ts + 1)
         ts[0] = 0.0
         ts[-1] = 1.0
-        ts = torch.cat([0.5*ts[:-1],1-0.5*ts.flip(dims=[0])])
+        ts = torch.cat([0.5*ts[:-1], 1 - 0.5*ts.flip(dims=[0])])
         ts = ts[torch.linspace(0,self.disc_steps,sub_steps+1,dtype=int)]
         return ts.cuda()

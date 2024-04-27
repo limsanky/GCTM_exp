@@ -21,8 +21,14 @@ def get_distance(distance):
             else:
                 return weight * lpips_dist(x,y).reshape(-1)
         return lpips_loss
+    elif distance == 'htransform':
+        return htransform_loss
     else:
         return None
+
+def htransform_loss(x, y, weight=None, reduce=True):
+    exit()
+    return 0
 
 def l1_loss(x,y,weight=None,reduce=True):
     weight = weight if (weight is not None) else torch.ones(size=[x.shape[0]]).to(x.device)
@@ -35,7 +41,7 @@ def l2_loss(x,y,weight=None):
     weight = weight if (weight is not None) else torch.ones(size=[x.shape[0]]).to(x.device)
     return (1/weight.square() * (x-y).flatten(start_dim=1).square().sum(dim=1)).sum()
 
-def ph_loss(x,y,weight=None,reduce=True):
+def ph_loss(x, y, weight=None, reduce=True):
     dim = x[0].flatten().shape[0]
     c = 0.00054 * np.sqrt(dim)
     weight = weight if (weight is not None) else torch.ones(size=[x.shape[0]]).to(x.device)

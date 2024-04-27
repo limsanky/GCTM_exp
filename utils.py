@@ -51,7 +51,8 @@ def eval_FID_ODE(sample_Xt, Xs_path, t_idx, s_idx, net, solver, sub_steps, n_sam
             if num_created == n_samples:
                 break
     with torch.no_grad():
-        fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=os.cpu_count(), verbose=verbose)
+        # fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=os.cpu_count(), verbose=verbose)
+        fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=2, verbose=verbose)
     if verbose:
         print('FID from Idx {} to Idx {} : {:.3f}'.format(t_idx,s_idx,fid))
         print('-------------------------------\n')
@@ -59,7 +60,11 @@ def eval_FID_ODE(sample_Xt, Xs_path, t_idx, s_idx, net, solver, sub_steps, n_sam
     return fid
 
 def eval_FID(sample_Xt, Xs_path, t, s, net, n_samples, sample_dir, fid_bs=500, invert=lambda x : x, verbose=True):
+    # print('sample dir', sample_dir)
     FID_dir = os.path.join(sample_dir, 'FID_samples')
+    # print('fid sample dir', FID_dir)
+    # print('stat dir?', Xs_path)
+    # exit()
     create_dir(FID_dir)
     num_created = 0
     net.eval()
@@ -72,7 +77,7 @@ def eval_FID(sample_Xt, Xs_path, t, s, net, n_samples, sample_dir, fid_bs=500, i
             Xt = sample_Xt()
             t_vec = t * torch.ones(size=[Xt.shape[0]]).cuda()
             s_vec = s * torch.ones(size=[Xt.shape[0]]).cuda()
-            Xs = tensor2img(invert(net(Xt,t_vec,s_vec)))
+            Xs = tensor2img(invert(net(Xt, t_vec, s_vec)))
         for i in range(Xs.shape[0]):
             img = Image.fromarray(Xs[i])
             img.save(os.path.join(FID_dir, '{}.png'.format(num_created)))
@@ -80,9 +85,17 @@ def eval_FID(sample_Xt, Xs_path, t, s, net, n_samples, sample_dir, fid_bs=500, i
             if num_created == n_samples:
                 break
     with torch.no_grad():
-        fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=os.cpu_count(), verbose=verbose)
+        # print('here:')
+        # print(Xs_path)
+        # print(FID_dir)
+        # stat_save_dir = Xs_path
+        # sample_save_dir = FID_dir
+        # save_fid_stats(paths=[sample_save_dir, stat_save_dir], batch_size=50, device='cuda:0', dims=2048, num_workers=4)
+        # exit()
+        # fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=os.cpu_count(), verbose=verbose)
+        fid = calculate_fid_given_paths([Xs_path, FID_dir], batch_size=fid_bs, device='cuda:0', dims=2048, num_workers=2, verbose=verbose)
     if verbose:
-        print('FID from {} to {} : {:.3f}'.format(t,s,fid))
+        print(f'FID from {t} to {s} : {fid:.3f}')
         print('-------------------------------\n')
     shutil.rmtree(FID_dir)
     return fid

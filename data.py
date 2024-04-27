@@ -40,8 +40,9 @@ class Sampler:
     
     def sample_joint(self):
         X0, X1 = self.__sample_X0__(), self.__sample_X1__()
-        X0, X1 = self.coupling(X0,X1)
+        X0, X1 = self.coupling(X0, X1)
         X1 = X1 + self.X1_eps_std * torch.randn_like(X1)
+        # assert(X1.is_cuda and X0.is_cuda), 'Data not in GPU.'
         return X0, X1
     
     def sample_X0(self):
@@ -92,7 +93,7 @@ def get_img_loader(dataset, root, bs, channels, size):
     NOISE_DATA = ['gaussian', 'sphere']
     batch_size = 1 if dataset in NOISE_DATA else bs
     if dataset == 'gaussian':
-        tfs = lambda x : torch.randn(size=[bs,channels,size,size])
+        tfs = lambda x : torch.randn(size=[bs, channels, size, size])
         train_data = TensorDataset(torch.zeros(size=[1]), transform=tfs)
         n_samples = 0
     elif dataset == 'sphere':
@@ -109,7 +110,13 @@ def get_img_loader(dataset, root, bs, channels, size):
         train_data = datasets.KMNIST(root=root, train=True, download=True, transform=img_tfs)
         n_samples = 60000
     elif dataset == 'cifar10':
+        # transform_train = transforms.Compose([
+        #     transforms.ToTensor(),
+        #     transforms.Resize(size, antialias=True),
+        #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        # ])
         train_data = datasets.CIFAR10(root=root, train=True, download=False, transform=img_tfs)
+        # train_data = datasets.CIFAR10(root=root, train=True, download=False, transform=transform_train)
         n_samples = 50000
     elif dataset == 'imagenet':
         tfs = transforms.Compose([transforms.ToTensor(),
@@ -135,7 +142,9 @@ def get_img_loader(dataset, root, bs, channels, size):
     elif dataset == 'edges2shoes':
         train_data = datasets.ImageFolder(root=os.path.join(root,'edges2shoes', 'train'), transform=img_tfs)
         n_samples = 69000
-    return DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    
+    # return DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
+    return DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
 def toy_generator(dataset, N):
     if dataset == 'gaussian':
