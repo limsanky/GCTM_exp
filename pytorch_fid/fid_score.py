@@ -42,6 +42,8 @@ from PIL import Image
 from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
 
+import gc
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -123,7 +125,7 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
                                              batch_size=batch_size,
                                              shuffle=False,
                                              drop_last=False,
-                                             num_workers=num_workers)
+                                             num_workers=num_workers,)
 
     pred_arr = np.empty((len(files), dims))
 
@@ -139,9 +141,11 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
         # This happens if you choose a dimensionality not equal 2048.
         if pred.size(2) != 1 or pred.size(3) != 1:
             pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
-
-        pred = pred.squeeze(3).squeeze(2).cpu().numpy()
-
+        
+        # pred = pred.squeeze(3).squeeze(2).cpu().numpy()
+        pred = pred.squeeze(3).squeeze(2).cpu()
+        pred = pred.float().numpy()
+        
         pred_arr[start_idx:start_idx + pred.shape[0]] = pred
 
         start_idx = start_idx + pred.shape[0]
@@ -282,7 +286,8 @@ def save_fid_stats(paths, batch_size, device, dims, num_workers=1):
     m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
                                         dims, device, num_workers)
 
-    np.savez_compressed(paths[1], mu=m1, sigma=s1)
+    with open(paths[1], 'wb') as f:
+        np.savez_compressed(f, mu=m1, sigma=s1)
 
 
 # def main():
