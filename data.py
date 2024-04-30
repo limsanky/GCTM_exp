@@ -113,7 +113,7 @@ def get_img_loader(dataset, root, bs, channels, size):
         # transform_train = transforms.Compose([
         #     transforms.ToTensor(),
         #     transforms.Resize(size, antialias=True),
-        #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        #     transforms.Normalize(mean=[0.5]*channels, std=[0.5]*channels),
         # ])
         train_data = datasets.CIFAR10(root=root, train=True, download=False, transform=img_tfs)
         # train_data = datasets.CIFAR10(root=root, train=True, download=False, transform=transform_train)

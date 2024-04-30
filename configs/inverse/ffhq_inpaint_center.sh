@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES=1 python train_gctm_inverse.py \
---datasets 'ffhq' \
+--datasets '/root/data/ffhq64' \
 --base_dir 'results/inverse/ffhq_inpaint_center' \
 --size 64 \
 --X1_eps_std 0.0 \
