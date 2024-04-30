@@ -329,10 +329,14 @@ class SongUNet(torch.nn.Module):
                 self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 self.dec[f'{res}x{res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, t, s, return_g=False, class_labels=None, augment_labels=None):
+    def forward(self, x, t, s, return_g_theta=False, class_labels=None, augment_labels=None, scalings={}):
         var0 = self.vars[0]
         var1 = self.vars[1]
         var01 = self.vars[2]
+        
+        a_t = scalings['a_t']
+        b_t = scalings['b_t']
+        c_t = scalings['c_t']
 
         if self.param == 'VE':
             # Convert everything to VE framework
@@ -466,9 +470,57 @@ class SongUNet(torch.nn.Module):
                 return emb
             
             t_emb, s_emb = embed_time(t.float(), 't'), embed_time(s.float(), 's')
+            
+        elif self.param == 'sfm':
+            # Convert everything to VE framework
+            SMAX = self.disc.smax if (self.disc.__class__.__name__ =='EDM_N2I') else  1 / self.disc.smin
+            SMIN = self.disc.smin 
+            
+            scale_t = 1/(1.0-t)
+            scale_t[scale_t==torch.inf] = SMAX
+            scale_s = 1/(1.0-s)
+            scale_s[scale_s==torch.inf] = SMAX
+            x = scale_t.reshape(-1,1,1,1) * x
+
+            t = t/(1.0-t)
+            t[t==torch.inf] = SMAX
+            s = s/(1.0-s)
+            s[s==torch.inf] = SMAX
+            
+            FOLLOW_DDBM_FOR_SFM_SCALINGS = False
+            if not FOLLOW_DDBM_FOR_SFM_SCALINGS:
+                sigma_data0, sigma_dataT = SMIN, SMAX
+                sigma_data0T = SMIN**2
+                
+                _tmp = np.square(a_t * sigma_dataT) + np.square(b_t * sigma_data0) + (2 * a_t * b_t * sigma_data0T) + c_t
+                cin = np.power(_tmp, -0.5)
+                
+                cskip = (b_t * np.square(sigma_data0) + a_t * sigma_data0T) * cin.squared()
+                cout = np.square(a_t) * (np.square(sigma_data0 * sigma_dataT) - np.square(sigma_data0T)) + (np.square(sigma_data0) * c_t)
+                cout = cout.sqrt() * cin
+            else:
+                cout = np.ones((1), dtype=np.float32)
+                cskip = np.zeros((1), dtype=np.float32)
+                cin = np.ones((1), dtype=np.float32)
+            
+            # Mapping.
+            def embed_time(noise_labels, time_label='t'):
+                noise_labels[noise_labels==0.0] = self.disc.smin
+                noise_labels = (1/4) * noise_labels.log()
+                emb = self.map_noise(noise_labels)
+                emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
+                if time_label == 't':
+                    emb = silu(self.t_map_layer0(emb))
+                    emb = silu(self.t_map_layer1(emb))
+                else:
+                    emb = silu(self.t_map_layer0(emb))
+                    emb = silu(self.t_map_layer1(emb))
+                return emb
+            
+            t_emb, s_emb = embed_time(t.float(), 't'), embed_time(s.float(), 's')
         
         else:
-            raise NotImplementedError("'param' has not been provided!")
+            raise NotImplementedError("'param' has not been provided to the UNet!")
         
         # Encoder.
         xt = x.clone()
@@ -502,22 +554,36 @@ class SongUNet(torch.nn.Module):
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, t_emb, s_emb)
         
+        
+        if (FOLLOW_DDBM_FOR_SFM_SCALINGS is not None) and FOLLOW_DDBM_FOR_SFM_SCALINGS:
+            # 0501: TODO: Do the sampling for when we do follow ddbm's sfm scalings. 
+            #             I.e. follow the sampling procedure of Tong et al.'s paper
+            raise NotImplementedError('TODO! (05/01)')
+            if return_g_theta:
+                if self.training:
+                    return aux, cout
+                else:
+                    return aux
+        
         # g = denoised of ddbm
         # aux = model_output of ddbm
-        g = cskip.reshape(-1,1,1,1) * xt + cout.reshape(-1,1,1,1) * aux
+        g_theta = cskip.reshape(-1,1,1,1) * xt + cout.reshape(-1,1,1,1) * aux
+        
+        if return_g_theta:
+            if self.training:
+                return g_theta, cout
+            else:
+                return g_theta
+        
         mask = torch.ones_like(t)
         mask[~(s == t)] = (s/t)[~(s == t)]
-        G = (mask.reshape(-1,1,1,1) * xt + (1 - mask).reshape(-1,1,1,1) * g) / scale_s.reshape(-1,1,1,1)
-        if return_g:
-            if self.training:
-                return g, cout
-            else:
-                return g
+        
+        G_theta = (mask.reshape(-1,1,1,1) * xt + (1 - mask).reshape(-1,1,1,1) * g_theta) / scale_s.reshape(-1,1,1,1)
+        
+        if self.training:
+            return G_theta, cout
         else:
-            if self.training:
-                return G, cout
-            else:
-                return G
+            return G_theta
 
 #----------------------------------------------------------------------------
 # Reimplementation of the ADM architecture from the paper
@@ -829,521 +895,521 @@ class EDMPrecond(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
-import torch.fft as fft
+# import torch.fft as fft
 
-def Fourier_filter(x, threshold, scale):
-    # FFT
-    x_freq = fft.fftn(x, dim=(-2, -1))
-    x_freq = fft.fftshift(x_freq, dim=(-2, -1))
+# def Fourier_filter(x, threshold, scale):
+#     # FFT
+#     x_freq = fft.fftn(x, dim=(-2, -1))
+#     x_freq = fft.fftshift(x_freq, dim=(-2, -1))
     
-    B, C, H, W = x_freq.shape
-    mask = torch.ones((B, C, H, W)).cuda() 
+#     B, C, H, W = x_freq.shape
+#     mask = torch.ones((B, C, H, W)).cuda() 
 
-    crow, ccol = H // 2, W //2
-    mask[..., crow - threshold:crow + threshold, ccol - threshold:ccol + threshold] = scale
-    x_freq = x_freq * mask
+#     crow, ccol = H // 2, W //2
+#     mask[..., crow - threshold:crow + threshold, ccol - threshold:ccol + threshold] = scale
+#     x_freq = x_freq * mask
 
-    # IFFT
-    x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
-    x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
+#     # IFFT
+#     x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
+#     x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
     
-    return x_filtered
+#     return x_filtered
 
-"""
-Various utilities for neural networks.
-"""
+# """
+# Various utilities for neural networks.
+# """
 
-import math
+# import math
 
-import torch as th
-import torch.nn as nn
-
-
-# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
-class SiLU(nn.Module):
-    def forward(self, x):
-        return x * th.sigmoid(x)
+# import torch as th
+# import torch.nn as nn
 
 
-class GroupNorm32(nn.GroupNorm):
-    def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+# # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
+# class SiLU(nn.Module):
+#     def forward(self, x):
+#         return x * th.sigmoid(x)
 
 
-def conv_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
+# class GroupNorm32(nn.GroupNorm):
+#     def forward(self, x):
+#         return super().forward(x.float()).type(x.dtype)
 
 
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Linear(*args, **kwargs)
+# def conv_nd(dims, *args, **kwargs):
+#     """
+#     Create a 1D, 2D, or 3D convolution module.
+#     """
+#     if dims == 1:
+#         return nn.Conv1d(*args, **kwargs)
+#     elif dims == 2:
+#         return nn.Conv2d(*args, **kwargs)
+#     elif dims == 3:
+#         return nn.Conv3d(*args, **kwargs)
+#     raise ValueError(f"unsupported dimensions: {dims}")
 
 
-def avg_pool_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D average pooling module.
-    """
-    if dims == 1:
-        return nn.AvgPool1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.AvgPool2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.AvgPool3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
+# def linear(*args, **kwargs):
+#     """
+#     Create a linear module.
+#     """
+#     return nn.Linear(*args, **kwargs)
 
 
-def update_ema(target_params, source_params, rate=0.99):
-    """
-    Update target parameters to be closer to those of source parameters using
-    an exponential moving average.
-
-    :param target_params: the target parameter sequence.
-    :param source_params: the source parameter sequence.
-    :param rate: the EMA rate (closer to 1 means slower).
-    """
-    for targ, src in zip(target_params, source_params):
-        targ.detach().mul_(rate).add_(src, alpha=1 - rate)
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
+# def avg_pool_nd(dims, *args, **kwargs):
+#     """
+#     Create a 1D, 2D, or 3D average pooling module.
+#     """
+#     if dims == 1:
+#         return nn.AvgPool1d(*args, **kwargs)
+#     elif dims == 2:
+#         return nn.AvgPool2d(*args, **kwargs)
+#     elif dims == 3:
+#         return nn.AvgPool3d(*args, **kwargs)
+#     raise ValueError(f"unsupported dimensions: {dims}")
 
 
-def scale_module(module, scale):
-    """
-    Scale the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().mul_(scale)
-    return module
+# def update_ema(target_params, source_params, rate=0.99):
+#     """
+#     Update target parameters to be closer to those of source parameters using
+#     an exponential moving average.
+
+#     :param target_params: the target parameter sequence.
+#     :param source_params: the source parameter sequence.
+#     :param rate: the EMA rate (closer to 1 means slower).
+#     """
+#     for targ, src in zip(target_params, source_params):
+#         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
 
-def mean_flat(tensor):
-    """
-    Take the mean over all non-batch dimensions.
-    """
-    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+# def zero_module(module):
+#     """
+#     Zero out the parameters of a module and return it.
+#     """
+#     for p in module.parameters():
+#         p.detach().zero_()
+#     return module
 
 
-def normalization(channels):
-    """
-    Make a standard normalization layer.
-
-    :param channels: number of input channels.
-    :return: an nn.Module for normalization.
-    """
-    return GroupNorm32(32, channels)
-
-
-def timestep_embedding(timesteps, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
-    """
-    half = dim // 2
-    freqs = th.exp(
-        -math.log(max_period) * th.arange(start=0, end=half, dtype=th.float32) / half
-    ).to(device=timesteps.device)
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = th.cat([th.cos(args), th.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
+# def scale_module(module, scale):
+#     """
+#     Scale the parameters of a module and return it.
+#     """
+#     for p in module.parameters():
+#         p.detach().mul_(scale)
+#     return module
 
 
-def checkpoint(func, inputs, params, flag):
-    """
-    Evaluate a function without caching intermediate activations, allowing for
-    reduced memory at the expense of extra compute in the backward pass.
-
-    :param func: the function to evaluate.
-    :param inputs: the argument sequence to pass to `func`.
-    :param params: a sequence of parameters `func` depends on but does not
-                   explicitly take as arguments.
-    :param flag: if False, disable gradient checkpointing.
-    """
-    if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
-    else:
-        return func(*inputs)
+# def mean_flat(tensor):
+#     """
+#     Take the mean over all non-batch dimensions.
+#     """
+#     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
-class CheckpointFunction(th.autograd.Function):
-    @staticmethod
-    def forward(ctx, run_function, length, *args):
-        ctx.run_function = run_function
-        ctx.input_tensors = list(args[:length])
-        ctx.input_params = list(args[length:])
-        with th.no_grad():
-            output_tensors = ctx.run_function(*ctx.input_tensors)
-        return output_tensors
+# def normalization(channels):
+#     """
+#     Make a standard normalization layer.
 
-    @staticmethod
-    def backward(ctx, *output_grads):
-        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with th.enable_grad():
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
-            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
-            output_tensors = ctx.run_function(*shallow_copies)
-        input_grads = th.autograd.grad(
-            output_tensors,
-            ctx.input_tensors + ctx.input_params,
-            output_grads,
-            allow_unused=True,
-        )
-        del ctx.input_tensors
-        del ctx.input_params
-        del output_tensors
-        return (None, None) + input_grads
+#     :param channels: number of input channels.
+#     :return: an nn.Module for normalization.
+#     """
+#     return GroupNorm32(32, channels)
 
-class UNetModel(torch.nn.Module):
-    """
-    The full UNet model with attention and timestep embedding.
 
-    :param in_channels: channels in the input Tensor.
-    :param model_channels: base channel count for the model.
-    :param out_channels: channels in the output Tensor.
-    :param num_res_blocks: number of residual blocks per downsample.
-    :param attention_resolutions: a collection of downsample rates at which
-        attention will take place. May be a set, list, or tuple.
-        For example, if this contains 4, then at 4x downsampling, attention
-        will be used.
-    :param dropout: the dropout probability.
-    :param channel_mult: channel multiplier for each level of the UNet.
-    :param conv_resample: if True, use learned convolutions for upsampling and
-        downsampling.
-    :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param num_classes: if specified (as an int), then this model will be
-        class-conditional with `num_classes` classes.
-    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
-    :param num_heads: the number of attention heads in each attention layer.
-    """
+# def timestep_embedding(timesteps, dim, max_period=10000):
+#     """
+#     Create sinusoidal timestep embeddings.
 
-    def __init__(
-        self,
-        in_channels,
-        model_channels,
-        out_channels,
-        num_res_blocks,
-        attention_resolutions,
-        dropout=0,
-        channel_mult=(1, 2, 4, 8),
-        conv_resample=True,
-        dims=2,
-        num_classes=None,
-        use_checkpoint=False,
-        num_heads=1,
-        num_heads_upsample=-1,
-        use_scale_shift_norm=False,
-    ):
-        super().__init__()
+#     :param timesteps: a 1-D Tensor of N indices, one per batch element.
+#                       These may be fractional.
+#     :param dim: the dimension of the output.
+#     :param max_period: controls the minimum frequency of the embeddings.
+#     :return: an [N x dim] Tensor of positional embeddings.
+#     """
+#     half = dim // 2
+#     freqs = th.exp(
+#         -math.log(max_period) * th.arange(start=0, end=half, dtype=th.float32) / half
+#     ).to(device=timesteps.device)
+#     args = timesteps[:, None].float() * freqs[None]
+#     embedding = th.cat([th.cos(args), th.sin(args)], dim=-1)
+#     if dim % 2:
+#         embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
+#     return embedding
 
-        if num_heads_upsample == -1:
-            num_heads_upsample = num_heads
 
-        self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
-        self.dropout = dropout
-        self.channel_mult = channel_mult
-        self.conv_resample = conv_resample
-        self.num_classes = num_classes
-        self.use_checkpoint = use_checkpoint
-        self.num_heads = num_heads
-        self.num_heads_upsample = num_heads_upsample
+# def checkpoint(func, inputs, params, flag):
+#     """
+#     Evaluate a function without caching intermediate activations, allowing for
+#     reduced memory at the expense of extra compute in the backward pass.
 
-        time_embed_dim = model_channels * 4
-        self.time_embed = torch.nn.Sequential(
-            linear(model_channels, time_embed_dim),
-            SiLU(),
-            linear(time_embed_dim, time_embed_dim),
-        )
+#     :param func: the function to evaluate.
+#     :param inputs: the argument sequence to pass to `func`.
+#     :param params: a sequence of parameters `func` depends on but does not
+#                    explicitly take as arguments.
+#     :param flag: if False, disable gradient checkpointing.
+#     """
+#     if flag:
+#         args = tuple(inputs) + tuple(params)
+#         return CheckpointFunction.apply(func, len(inputs), *args)
+#     else:
+#         return func(*inputs)
 
-        if self.num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
-        self.input_blocks = nn.ModuleList(
-            [
-                TimestepEmbedSequential(
-                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
-                )
-            ]
-        )
-        input_block_chans = [model_channels]
-        ch = model_channels
-        ds = 1
-        for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
-                layers = [
-                    ResBlock(
-                        ch,
-                        time_embed_dim,
-                        dropout,
-                        out_channels=mult * model_channels,
-                        dims=dims,
-                        use_checkpoint=use_checkpoint,
-                        use_scale_shift_norm=use_scale_shift_norm,
-                    )
-                ]
-                ch = mult * model_channels
-                if ds in attention_resolutions:
-                    layers.append(
-                        AttentionBlock(
-                            ch, use_checkpoint=use_checkpoint, num_heads=num_heads
-                        )
-                    )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
-                input_block_chans.append(ch)
-            if level != len(channel_mult) - 1:
-                self.input_blocks.append(
-                    TimestepEmbedSequential(Downsample(ch, conv_resample, dims=dims))
-                )
-                input_block_chans.append(ch)
-                ds *= 2
+# class CheckpointFunction(th.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, run_function, length, *args):
+#         ctx.run_function = run_function
+#         ctx.input_tensors = list(args[:length])
+#         ctx.input_params = list(args[length:])
+#         with th.no_grad():
+#             output_tensors = ctx.run_function(*ctx.input_tensors)
+#         return output_tensors
 
-        self.middle_block = TimestepEmbedSequential(
-            ResBlock(
-                ch,
-                time_embed_dim,
-                dropout,
-                dims=dims,
-                use_checkpoint=use_checkpoint,
-                use_scale_shift_norm=use_scale_shift_norm,
-            ),
-            AttentionBlock(ch, use_checkpoint=use_checkpoint, num_heads=num_heads),
-            ResBlock(
-                ch,
-                time_embed_dim,
-                dropout,
-                dims=dims,
-                use_checkpoint=use_checkpoint,
-                use_scale_shift_norm=use_scale_shift_norm,
-            ),
-        )
+#     @staticmethod
+#     def backward(ctx, *output_grads):
+#         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+#         with th.enable_grad():
+#             # Fixes a bug where the first op in run_function modifies the
+#             # Tensor storage in place, which is not allowed for detach()'d
+#             # Tensors.
+#             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+#             output_tensors = ctx.run_function(*shallow_copies)
+#         input_grads = th.autograd.grad(
+#             output_tensors,
+#             ctx.input_tensors + ctx.input_params,
+#             output_grads,
+#             allow_unused=True,
+#         )
+#         del ctx.input_tensors
+#         del ctx.input_params
+#         del output_tensors
+#         return (None, None) + input_grads
 
-        self.output_blocks = nn.ModuleList([])
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            for i in range(num_res_blocks + 1):
-                layers = [
-                    ResBlock(
-                        ch + input_block_chans.pop(),
-                        time_embed_dim,
-                        dropout,
-                        out_channels=model_channels * mult,
-                        dims=dims,
-                        use_checkpoint=use_checkpoint,
-                        use_scale_shift_norm=use_scale_shift_norm,
-                    )
-                ]
-                ch = model_channels * mult
-                if ds in attention_resolutions:
-                    layers.append(
-                        AttentionBlock(
-                            ch,
-                            use_checkpoint=use_checkpoint,
-                            num_heads=num_heads_upsample,
-                        )
-                    )
-                if level and i == num_res_blocks:
-                    layers.append(Upsample(ch, conv_resample, dims=dims))
-                    ds //= 2
-                self.output_blocks.append(TimestepEmbedSequential(*layers))
+# class UNetModel(torch.nn.Module):
+#     """
+#     The full UNet model with attention and timestep embedding.
 
-        self.out = nn.Sequential(
-            normalization(ch),
-            SiLU(),
-            zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
-        )
+#     :param in_channels: channels in the input Tensor.
+#     :param model_channels: base channel count for the model.
+#     :param out_channels: channels in the output Tensor.
+#     :param num_res_blocks: number of residual blocks per downsample.
+#     :param attention_resolutions: a collection of downsample rates at which
+#         attention will take place. May be a set, list, or tuple.
+#         For example, if this contains 4, then at 4x downsampling, attention
+#         will be used.
+#     :param dropout: the dropout probability.
+#     :param channel_mult: channel multiplier for each level of the UNet.
+#     :param conv_resample: if True, use learned convolutions for upsampling and
+#         downsampling.
+#     :param dims: determines if the signal is 1D, 2D, or 3D.
+#     :param num_classes: if specified (as an int), then this model will be
+#         class-conditional with `num_classes` classes.
+#     :param use_checkpoint: use gradient checkpointing to reduce memory usage.
+#     :param num_heads: the number of attention heads in each attention layer.
+#     """
 
-    def convert_to_fp16(self):
-        """
-        Convert the torso of the model to float16.
-        """
-        self.input_blocks.apply(convert_module_to_f16)
-        self.middle_block.apply(convert_module_to_f16)
-        self.output_blocks.apply(convert_module_to_f16)
+#     def __init__(
+#         self,
+#         in_channels,
+#         model_channels,
+#         out_channels,
+#         num_res_blocks,
+#         attention_resolutions,
+#         dropout=0,
+#         channel_mult=(1, 2, 4, 8),
+#         conv_resample=True,
+#         dims=2,
+#         num_classes=None,
+#         use_checkpoint=False,
+#         num_heads=1,
+#         num_heads_upsample=-1,
+#         use_scale_shift_norm=False,
+#     ):
+#         super().__init__()
 
-    def convert_to_fp32(self):
-        """
-        Convert the torso of the model to float32.
-        """
-        self.input_blocks.apply(convert_module_to_f32)
-        self.middle_block.apply(convert_module_to_f32)
-        self.output_blocks.apply(convert_module_to_f32)
+#         if num_heads_upsample == -1:
+#             num_heads_upsample = num_heads
 
-    @property
-    def inner_dtype(self):
-        """
-        Get the dtype used by the torso of the model.
-        """
-        return next(self.input_blocks.parameters()).dtype
+#         self.in_channels = in_channels
+#         self.model_channels = model_channels
+#         self.out_channels = out_channels
+#         self.num_res_blocks = num_res_blocks
+#         self.attention_resolutions = attention_resolutions
+#         self.dropout = dropout
+#         self.channel_mult = channel_mult
+#         self.conv_resample = conv_resample
+#         self.num_classes = num_classes
+#         self.use_checkpoint = use_checkpoint
+#         self.num_heads = num_heads
+#         self.num_heads_upsample = num_heads_upsample
 
-    def forward(self, x, timesteps, y=None):
-        """
-        Apply the model to an input batch.
+#         time_embed_dim = model_channels * 4
+#         self.time_embed = torch.nn.Sequential(
+#             linear(model_channels, time_embed_dim),
+#             SiLU(),
+#             linear(time_embed_dim, time_embed_dim),
+#         )
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
+#         if self.num_classes is not None:
+#             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
-        hs = []
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+#         self.input_blocks = nn.ModuleList(
+#             [
+#                 TimestepEmbedSequential(
+#                     conv_nd(dims, in_channels, model_channels, 3, padding=1)
+#                 )
+#             ]
+#         )
+#         input_block_chans = [model_channels]
+#         ch = model_channels
+#         ds = 1
+#         for level, mult in enumerate(channel_mult):
+#             for _ in range(num_res_blocks):
+#                 layers = [
+#                     ResBlock(
+#                         ch,
+#                         time_embed_dim,
+#                         dropout,
+#                         out_channels=mult * model_channels,
+#                         dims=dims,
+#                         use_checkpoint=use_checkpoint,
+#                         use_scale_shift_norm=use_scale_shift_norm,
+#                     )
+#                 ]
+#                 ch = mult * model_channels
+#                 if ds in attention_resolutions:
+#                     layers.append(
+#                         AttentionBlock(
+#                             ch, use_checkpoint=use_checkpoint, num_heads=num_heads
+#                         )
+#                     )
+#                 self.input_blocks.append(TimestepEmbedSequential(*layers))
+#                 input_block_chans.append(ch)
+#             if level != len(channel_mult) - 1:
+#                 self.input_blocks.append(
+#                     TimestepEmbedSequential(Downsample(ch, conv_resample, dims=dims))
+#                 )
+#                 input_block_chans.append(ch)
+#                 ds *= 2
 
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+#         self.middle_block = TimestepEmbedSequential(
+#             ResBlock(
+#                 ch,
+#                 time_embed_dim,
+#                 dropout,
+#                 dims=dims,
+#                 use_checkpoint=use_checkpoint,
+#                 use_scale_shift_norm=use_scale_shift_norm,
+#             ),
+#             AttentionBlock(ch, use_checkpoint=use_checkpoint, num_heads=num_heads),
+#             ResBlock(
+#                 ch,
+#                 time_embed_dim,
+#                 dropout,
+#                 dims=dims,
+#                 use_checkpoint=use_checkpoint,
+#                 use_scale_shift_norm=use_scale_shift_norm,
+#             ),
+#         )
 
-        h = x.type(self.inner_dtype)
-        for module in self.input_blocks:
-            h = module(h, emb)
-            hs.append(h)
-        h = self.middle_block(h, emb)
-        for module in self.output_blocks:
-            cat_in = th.cat([h, hs.pop()], dim=1)
-            h = module(cat_in, emb)
-        h = h.type(x.dtype)
-        return self.out(h)
+#         self.output_blocks = nn.ModuleList([])
+#         for level, mult in list(enumerate(channel_mult))[::-1]:
+#             for i in range(num_res_blocks + 1):
+#                 layers = [
+#                     ResBlock(
+#                         ch + input_block_chans.pop(),
+#                         time_embed_dim,
+#                         dropout,
+#                         out_channels=model_channels * mult,
+#                         dims=dims,
+#                         use_checkpoint=use_checkpoint,
+#                         use_scale_shift_norm=use_scale_shift_norm,
+#                     )
+#                 ]
+#                 ch = model_channels * mult
+#                 if ds in attention_resolutions:
+#                     layers.append(
+#                         AttentionBlock(
+#                             ch,
+#                             use_checkpoint=use_checkpoint,
+#                             num_heads=num_heads_upsample,
+#                         )
+#                     )
+#                 if level and i == num_res_blocks:
+#                     layers.append(Upsample(ch, conv_resample, dims=dims))
+#                     ds //= 2
+#                 self.output_blocks.append(TimestepEmbedSequential(*layers))
 
-    def get_feature_vectors(self, x, timesteps, y=None):
-        """
-        Apply the model and return all of the intermediate tensors.
+#         self.out = nn.Sequential(
+#             normalization(ch),
+#             SiLU(),
+#             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
+#         )
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: a dict with the following keys:
-                 - 'down': a list of hidden state tensors from downsampling.
-                 - 'middle': the tensor of the output of the lowest-resolution
-                             block in the model.
-                 - 'up': a list of hidden state tensors from upsampling.
-        """
-        hs = []
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
-        result = dict(down=[], up=[])
-        h = x.type(self.inner_dtype)
-        for module in self.input_blocks:
-            h = module(h, emb)
-            hs.append(h)
-            result["down"].append(h.type(x.dtype))
-        h = self.middle_block(h, emb)
-        result["middle"] = h.type(x.dtype)
-        for module in self.output_blocks:
-            cat_in = th.cat([h, hs.pop()], dim=1)
-            h = module(cat_in, emb)
-            result["up"].append(h.type(x.dtype))
-        return result
+#     def convert_to_fp16(self):
+#         """
+#         Convert the torso of the model to float16.
+#         """
+#         self.input_blocks.apply(convert_module_to_f16)
+#         self.middle_block.apply(convert_module_to_f16)
+#         self.output_blocks.apply(convert_module_to_f16)
+
+#     def convert_to_fp32(self):
+#         """
+#         Convert the torso of the model to float32.
+#         """
+#         self.input_blocks.apply(convert_module_to_f32)
+#         self.middle_block.apply(convert_module_to_f32)
+#         self.output_blocks.apply(convert_module_to_f32)
+
+#     @property
+#     def inner_dtype(self):
+#         """
+#         Get the dtype used by the torso of the model.
+#         """
+#         return next(self.input_blocks.parameters()).dtype
+
+#     def forward(self, x, timesteps, y=None):
+#         """
+#         Apply the model to an input batch.
+
+#         :param x: an [N x C x ...] Tensor of inputs.
+#         :param timesteps: a 1-D batch of timesteps.
+#         :param y: an [N] Tensor of labels, if class-conditional.
+#         :return: an [N x C x ...] Tensor of outputs.
+#         """
+#         assert (y is not None) == (
+#             self.num_classes is not None
+#         ), "must specify y if and only if the model is class-conditional"
+
+#         hs = []
+#         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+
+#         if self.num_classes is not None:
+#             assert y.shape == (x.shape[0],)
+#             emb = emb + self.label_emb(y)
+
+#         h = x.type(self.inner_dtype)
+#         for module in self.input_blocks:
+#             h = module(h, emb)
+#             hs.append(h)
+#         h = self.middle_block(h, emb)
+#         for module in self.output_blocks:
+#             cat_in = th.cat([h, hs.pop()], dim=1)
+#             h = module(cat_in, emb)
+#         h = h.type(x.dtype)
+#         return self.out(h)
+
+#     def get_feature_vectors(self, x, timesteps, y=None):
+#         """
+#         Apply the model and return all of the intermediate tensors.
+
+#         :param x: an [N x C x ...] Tensor of inputs.
+#         :param timesteps: a 1-D batch of timesteps.
+#         :param y: an [N] Tensor of labels, if class-conditional.
+#         :return: a dict with the following keys:
+#                  - 'down': a list of hidden state tensors from downsampling.
+#                  - 'middle': the tensor of the output of the lowest-resolution
+#                              block in the model.
+#                  - 'up': a list of hidden state tensors from upsampling.
+#         """
+#         hs = []
+#         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+#         if self.num_classes is not None:
+#             assert y.shape == (x.shape[0],)
+#             emb = emb + self.label_emb(y)
+#         result = dict(down=[], up=[])
+#         h = x.type(self.inner_dtype)
+#         for module in self.input_blocks:
+#             h = module(h, emb)
+#             hs.append(h)
+#             result["down"].append(h.type(x.dtype))
+#         h = self.middle_block(h, emb)
+#         result["middle"] = h.type(x.dtype)
+#         for module in self.output_blocks:
+#             cat_in = th.cat([h, hs.pop()], dim=1)
+#             h = module(cat_in, emb)
+#             result["up"].append(h.type(x.dtype))
+#         return result
     
-class Free_UNetModel(UNetModel):
-    """
-    :param b1: backbone factor of the first stage block of decoder.
-    :param b2: backbone factor of the second stage block of decoder.
-    :param s1: skip factor of the first stage block of decoder.
-    :param s2: skip factor of the second stage block of decoder.
-    """
+# class Free_UNetModel(UNetModel):
+#     """
+#     :param b1: backbone factor of the first stage block of decoder.
+#     :param b2: backbone factor of the second stage block of decoder.
+#     :param s1: skip factor of the first stage block of decoder.
+#     :param s2: skip factor of the second stage block of decoder.
+#     """
 
-    def __init__(
-        self,
-        b1,
-        b2,
-        s1,
-        s2,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.b1 = b1 
-        self.b2 = b2
-        self.s1 = s1
-        self.s2 = s2
+#     def __init__(
+#         self,
+#         b1,
+#         b2,
+#         s1,
+#         s2,
+#         *args,
+#         **kwargs
+#     ):
+#         super().__init__(*args, **kwargs)
+#         self.b1 = b1 
+#         self.b2 = b2
+#         self.s1 = s1
+#         self.s2 = s2
 
-    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
-        """
-        Apply the model to an input batch.
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param context: conditioning plugged in via crossattn
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-        hs = []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-        emb = self.time_embed(t_emb)
+#     def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+#         """
+#         Apply the model to an input batch.
+#         :param x: an [N x C x ...] Tensor of inputs.
+#         :param timesteps: a 1-D batch of timesteps.
+#         :param context: conditioning plugged in via crossattn
+#         :param y: an [N] Tensor of labels, if class-conditional.
+#         :return: an [N x C x ...] Tensor of outputs.
+#         """
+#         assert (y is not None) == (
+#             self.num_classes is not None
+#         ), "must specify y if and only if the model is class-conditional"
+#         hs = []
+#         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+#         emb = self.time_embed(t_emb)
 
-        if self.num_classes is not None:
-            assert y.shape[0] == x.shape[0]
-            emb = emb + self.label_emb(y)
+#         if self.num_classes is not None:
+#             assert y.shape[0] == x.shape[0]
+#             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
-        h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
-            hs_ = hs.pop()
+#         h = x.type(self.dtype)
+#         for module in self.input_blocks:
+#             h = module(h, emb, context)
+#             hs.append(h)
+#         h = self.middle_block(h, emb, context)
+#         for module in self.output_blocks:
+#             hs_ = hs.pop()
 
-            # --------------- FreeU code -----------------------
-            # Only operate on the first two stages
-            if h.shape[1] == 1280:
-                hidden_mean = h.mean(1).unsqueeze(1)
-                B = hidden_mean.shape[0]
-                hidden_max, _ = torch.max(hidden_mean.view(B, -1), dim=-1, keepdim=True) 
-                hidden_min, _ = torch.min(hidden_mean.view(B, -1), dim=-1, keepdim=True)
-                hidden_mean = (hidden_mean - hidden_min.unsqueeze(2).unsqueeze(3)) / (hidden_max - hidden_min).unsqueeze(2).unsqueeze(3)
+#             # --------------- FreeU code -----------------------
+#             # Only operate on the first two stages
+#             if h.shape[1] == 1280:
+#                 hidden_mean = h.mean(1).unsqueeze(1)
+#                 B = hidden_mean.shape[0]
+#                 hidden_max, _ = torch.max(hidden_mean.view(B, -1), dim=-1, keepdim=True) 
+#                 hidden_min, _ = torch.min(hidden_mean.view(B, -1), dim=-1, keepdim=True)
+#                 hidden_mean = (hidden_mean - hidden_min.unsqueeze(2).unsqueeze(3)) / (hidden_max - hidden_min).unsqueeze(2).unsqueeze(3)
 
-                h[:,:640] = h[:,:640] * ((self.b1 - 1 ) * hidden_mean + 1)
-                hs_ = Fourier_filter(hs_, threshold=1, scale=self.s1)
-            if h.shape[1] == 640:
-                hidden_mean = h.mean(1).unsqueeze(1)
-                B = hidden_mean.shape[0]
-                hidden_max, _ = torch.max(hidden_mean.view(B, -1), dim=-1, keepdim=True) 
-                hidden_min, _ = torch.min(hidden_mean.view(B, -1), dim=-1, keepdim=True)
-                hidden_mean = (hidden_mean - hidden_min.unsqueeze(2).unsqueeze(3)) / (hidden_max - hidden_min).unsqueeze(2).unsqueeze(3)
+#                 h[:,:640] = h[:,:640] * ((self.b1 - 1 ) * hidden_mean + 1)
+#                 hs_ = Fourier_filter(hs_, threshold=1, scale=self.s1)
+#             if h.shape[1] == 640:
+#                 hidden_mean = h.mean(1).unsqueeze(1)
+#                 B = hidden_mean.shape[0]
+#                 hidden_max, _ = torch.max(hidden_mean.view(B, -1), dim=-1, keepdim=True) 
+#                 hidden_min, _ = torch.min(hidden_mean.view(B, -1), dim=-1, keepdim=True)
+#                 hidden_mean = (hidden_mean - hidden_min.unsqueeze(2).unsqueeze(3)) / (hidden_max - hidden_min).unsqueeze(2).unsqueeze(3)
 
-                h[:,:320] = h[:,:320] * ((self.b2 - 1 ) * hidden_mean + 1)
-                hs_ = Fourier_filter(hs_, threshold=1, scale=self.s2)
-            # ---------------------------------------------------------
+#                 h[:,:320] = h[:,:320] * ((self.b2 - 1 ) * hidden_mean + 1)
+#                 hs_ = Fourier_filter(hs_, threshold=1, scale=self.s2)
+#             # ---------------------------------------------------------
 
-            h = torch.cat([h, hs_], dim=1)
-            h = module(h, emb, context)
-        h = h.type(x.dtype)
-        if self.predict_codebook_ids:
-            return self.id_predictor(h)
-        else:
-            return self.out(h)
+#             h = torch.cat([h, hs_], dim=1)
+#             h = module(h, emb, context)
+#         h = h.type(x.dtype)
+#         if self.predict_codebook_ids:
+#             return self.id_predictor(h)
+#         else:
+#             return self.out(h)
