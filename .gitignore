@@ -5,3 +5,6 @@ torch_utils/
 *.pyc
 dnnlib/*
 dnnlib/__pycache__/__init__.cpython-310.pyc
+*.pyc
+*.pyc
+*.npz
