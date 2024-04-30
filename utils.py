@@ -319,6 +319,23 @@ def viz_2d(Xt_eval, t, s, net, sample_dir, idx):
     plt.savefig(os.path.join(sample_dir, 'sample_curr.jpg'), bbox_inches='tight', dpi=200)
     plt.close()
 
+def backup_dir(path, prompt=False, backup_silently=True):
+    completed_backup = False
+    if os.path.isdir(path):
+        if backup_silently:
+            shutil.copytree(path, args.save_dir+'/scripts')
+            completed_backup = True
+            
+        if prompt and not completed_backup:
+            reply = input("\nBackup code? [y/n]: {}".format(path))
+            if reply=='y':
+                shutil.copytree(source_folder, args.save_dir+'/scripts')
+                completed_backup = True
+
+    os.makedirs(path)
+    
+    
+
 def create_dir(path,prompt=False):
     if os.path.isdir(path):
         if prompt:
@@ -373,3 +390,4 @@ def update_grad_list(net, grad_list):
 
 def project(x, y):
     return x - (x * y).sum() / (y.norm().square() + 1e-8) * y
+
